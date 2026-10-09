@@ -27,7 +27,7 @@ def register_prompts(mcp: FastMCP) -> None:
 
 Steps:
 1. aw_find_politician("{politician}"). If needs_user_choice is true, ask me which person is meant before continuing.
-2. aw_get_politician(politician_id) to see mandates, factions and the party they ran for.
+2. aw_get_politician(politician_id) to see party, mandates (parliament, period, faction, how the seat was won).
 3. aw_find_election_programs(politician_id) for the programme of the election that led to the mandate.
 4. For each theme: aw_read_election_program(program_id, query=<theme words>) and note the position with its page number.
 5. For the same theme: aw_politician_votes(politician_id, topic or keyword{', since' if since else ''}).
@@ -40,8 +40,8 @@ Steps:
     def mp_overview(politician: Annotated[str, Field(description='Name of the MP.')]) -> str:
         return f"""Write a neutral overview of {politician}.
 
-1. aw_find_politician("{politician}"); ask me if several people fit.
-2. aw_get_politician: party, mandates (parliament, period, faction, how the seat was won).
+1. aw_find_politician("{politician}"); If needs_user_choice is true, ask me which person is meant before continuing.
+2. aw_get_politician(politician_id) to see party, mandates (parliament, period, faction, how the seat was won).
 3. aw_committees(politician_id): committee roles.
 4. aw_get_sidejobs(politician_id): categories, highest income level, how many entries have no income reported (Bundestag only).
 5. aw_politician_votes(politician_id, limit=10): the latest roll-call votes.
