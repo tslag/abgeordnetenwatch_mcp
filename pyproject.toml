@@ -1,0 +1,26 @@
+[project]
+name = "abgeordnetenwatch-mcp"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "fastmcp>=4.0.11",
+    "httpx>=0.28.1",
+    "pydantic>=2.13.5",
+    "pypdf>=6.19.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+]
+
+[tool.pytest.ini_options]
+# the server and its tests import top-level packages from src/ (aw, tools, resources, prompts)
+pythonpath = ["src"]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = ["live: hits the real Abgeordnetenwatch API (run with: pytest -m live)"]
+addopts = "-m 'not live'"
