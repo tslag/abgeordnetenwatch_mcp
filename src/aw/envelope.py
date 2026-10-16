@@ -33,7 +33,10 @@ def envelope(
     out: dict[str, Any] = {"summary": summary, "data": data}
     if page is not None:
         out["page"] = page
-    out["notes"] = [n for n in (notes or []) if n]
+    all_notes = [n for n in (notes or []) if n]
+    if session is not None and session.throttled >= 2:
+        all_notes.append(f"Waited {session.throttled:.0f}s to stay within the API rate limit (about 30 requests/minute); repeated queries are served from cache.")
+    out["notes"] = all_notes
     out["sources"] = list(dict.fromkeys(s for s in (sources or []) if s))
     meta: dict[str, Any] = {"data_as_of": datetime.now(UTC).strftime("%Y-%m-%dT%H:%MZ")}
     if session is not None:

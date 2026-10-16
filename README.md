@@ -31,7 +31,8 @@ or in a desktop client's `mcp.json`:
 | Environment variable | Default | Meaning |
 |---|---|---|
 | `AW_CACHE_PATH` | *(off)* | sqlite file; keeps cached API answers across restarts |
-| `AW_RATE_LIMIT` | `24` | max API requests per minute (the API allows 30 per IP) |
+| `AW_RATE_LIMIT` | `12` | sustained API requests per minute; the API documents 30, but a measured steady state of ~15/min was where 429s began |
+| `AW_RATE_BURST` | `4` | requests that may go out back to back (spaced 1.5 s apart) before the sustained rate applies |
 | `AW_ENABLE_RAW_QUERY` | *(off)* | set to `1` to also expose the `aw_query` escape hatch |
 
 ## Tools
@@ -69,7 +70,7 @@ These were verified against the live API (v2.9.0); the rest of the code depends 
 
 | Fact | Consequence |
 |---|---|
-| 30 requests/min per IP | Sliding-window limiter, caching, per-call request budget, bulk fetch + local join. |
+| Documented 30 requests/min per IP, **measured ~15/min sustained with a burst of ~10, and ≥1.2 s between requests** | Pacing limiter (12/min, burst 4 spaced 1.5 s, halves its pace after a 429), caching, per-call request budget, bulk fetch + local join. |
 | `votes` rows have no date or topic and cannot be filtered by poll fields (HTTP 500) | A voting record is a join per legislature period: the MP's votes ⋈ the period's polls (filtered by topic/date/title). |
 | No aggregate endpoints | Faction tallies are computed server-side from `polls/{id}?related_data=votes`. |
 | `candidacies-mandates` hides former mandates unless `current_on=all` | Always sent; `is_current` is derived. |

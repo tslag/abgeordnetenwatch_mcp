@@ -1,6 +1,7 @@
 """Rate-limited, cached, request-budgeted client for the Abgeordnetenwatch API v2.
 
-* Sliding-window limiter (default 24/min) keeps well below the API's 30 req/min per IP.
+* A pacing limiter (token bucket + minimum gap + adaptive slowdown, see ``ratelimit``) keeps requests
+  well below the API's limits - the API reacts to bursts, not only to the per-minute total.
 * Responses are cached (memory, optionally sqlite); identical in-flight requests are coalesced.
 * Every tool call works through an :class:`AWSession` that enforces a per-call request budget and
   reports how many requests were really sent vs. served from cache.
@@ -9,8 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import time
-from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -20,46 +19,18 @@ import httpx
 from .cache import MISS, DiskCache, LayeredCache, TTLCache
 from .endpoints import BASE_URL, ENDPOINTS, TTL_ENTITY
 from .errors import AWApiError, AWBudgetExceeded, AWNotFound, AWRateLimited
+from .ratelimit import RateLimiter
+
+__all__ = ["AWClient", "AWSession", "ListResult", "RateLimiter", "get_client", "set_client", "normalize_params"]
 
 USER_AGENT = "abgeordnetenwatch-mcp/1.0 (read-only MCP server; CC0 data)"
 MAX_PAGE = 1000  # API maximum for range_end / pager_limit
-
-
-class RateLimiter:
-    """Allow at most ``max_calls`` requests in any ``period``-second window."""
-
-    def __init__(
-        self,
-        max_calls: int = 24,
-        period: float = 60.0,
-        clock: Callable[[], float] = time.monotonic,
-        sleep: Callable[[float], Any] = asyncio.sleep,
-    ) -> None:
-        self.max_calls = max_calls
-        self.period = period
-        self._clock = clock
-        self._sleep = sleep
-        self._calls: deque[float] = deque()
-        self._blocked_until = 0.0
-        self._lock = asyncio.Lock()
-
-    def block_for(self, seconds: float) -> None:
-        """Stop all requests for a while (after an HTTP 429)."""
-        self._blocked_until = max(self._blocked_until, self._clock() + seconds)
-
-    async def acquire(self) -> None:
-        async with self._lock:
-            while True:
-                now = self._clock()
-                if now < self._blocked_until:
-                    await self._sleep(self._blocked_until - now)
-                    continue
-                while self._calls and now - self._calls[0] >= self.period:
-                    self._calls.popleft()
-                if len(self._calls) < self.max_calls:
-                    self._calls.append(now)
-                    return
-                await self._sleep(self.period - (now - self._calls[0]) + 0.01)
+MAX_ATTEMPTS = 5  # per logical request, counting network errors, gateway errors and 429s
+MAX_429_RETRIES = 2  # after the 3rd HTTP 429 in a row the call gives up
+RATE_LIMITED_MESSAGE = (
+    "Abgeordnetenwatch API is rate limiting (HTTP 429) even after backing off. The limit is per IP address "
+    "and may be shared with other programs; retry in about a minute."
+)
 
 
 @dataclass
@@ -123,12 +94,16 @@ class AWClient:
     def session(self, budget: int = 8) -> AWSession:
         return AWSession(self, budget)
 
-    async def _fetch(self, path: str, params: dict[str, str]) -> dict:
-        """One logical request: limiter, network retries, 429 handling, error mapping."""
+    async def _fetch(self, path: str, params: dict[str, str]) -> tuple[dict, float]:
+        """One logical request: pacing, network retries, 429 backoff, error mapping.
+
+        Returns ``(payload, seconds_spent_waiting_for_the_rate_limit)``.
+        """
         last_exc: Exception | None = None
-        rate_limited_once = False
-        for attempt in range(3):
-            await self.limiter.acquire()
+        rate_limited = 0
+        waited = 0.0
+        for attempt in range(MAX_ATTEMPTS):
+            waited += await self.limiter.acquire()
             try:
                 response = await self._client().get(path, params=params)
             except httpx.TransportError as exc:  # timeouts, connection resets, ...
@@ -137,19 +112,19 @@ class AWClient:
                 continue
 
             if response.status_code == 429:
-                wait = min(_retry_after(response) or 20.0, 20.0)
-                self.limiter.block_for(wait)
-                if rate_limited_once:
-                    raise AWRateLimited("Abgeordnetenwatch API is rate limiting (HTTP 429); retry in about a minute.")
-                rate_limited_once = True
+                self.limiter.on_rate_limited(_retry_after(response))  # pauses everything, halves the pace
+                rate_limited += 1
+                if rate_limited > MAX_429_RETRIES:
+                    raise AWRateLimited(RATE_LIMITED_MESSAGE)
                 continue
             if response.status_code in (502, 503, 504):
                 last_exc = AWApiError(f"HTTP {response.status_code} from the API", response.status_code)
                 await self._sleep(0.5 * (attempt + 1))
                 continue
-            return _parse(response, path)
-        if rate_limited_once and last_exc is None:
-            raise AWRateLimited("Abgeordnetenwatch API is rate limiting (HTTP 429); retry in about a minute.")
+            self.limiter.on_success()
+            return _parse(response, path), waited
+        if rate_limited and last_exc is None:
+            raise AWRateLimited(RATE_LIMITED_MESSAGE)
         raise AWApiError(f"API unreachable: {last_exc}") from last_exc
 
     async def request(self, path: str, params: dict[str, str], ttl: float, session: AWSession | None = None) -> tuple[dict, bool]:
@@ -160,15 +135,18 @@ class AWClient:
             return hit, True
         task = self._inflight.get(key)
         if task is not None:
-            return await asyncio.shield(task), True
+            payload, _ = await asyncio.shield(task)
+            return payload, True
         if session is not None:
             session._spend()
         task = asyncio.ensure_future(self._fetch(path, params))
         self._inflight[key] = task
         try:
-            payload = await asyncio.shield(task)
+            payload, waited = await asyncio.shield(task)
         finally:
             self._inflight.pop(key, None)
+        if session is not None:
+            session.throttled += waited
         self.cache.set(key, payload, ttl)
         return payload, False
 
@@ -204,18 +182,22 @@ class AWSession:
     budget: int = 8
     requests: int = 0
     cached: int = 0
+    throttled: float = 0.0  # seconds this call spent waiting for the rate limiter
     _notes: list[str] = field(default_factory=list)
 
     def _spend(self) -> None:
         if self.requests >= self.budget:
             raise AWBudgetExceeded(
-                f"This call would need more than {self.budget} API requests (API limit: 30 per minute). "
+                f"This call would need more than {self.budget} API requests (the API allows about 30 per minute). "
                 "Narrow the query (period, topic, dates)."
             )
         self.requests += 1
 
     def usage(self) -> dict:
-        return {"requests": self.requests, "cached": self.cached}
+        usage: dict[str, Any] = {"requests": self.requests, "cached": self.cached}
+        if self.throttled >= 0.5:
+            usage["throttled_s"] = round(self.throttled, 1)
+        return usage
 
     async def list(self, entity: str, params: Mapping[str, Any] | None = None, ttl: float = TTL_ENTITY) -> ListResult:
         payload, was_cached = await self.client.request(ENDPOINTS[entity], normalize_params(params), ttl, self)
@@ -264,13 +246,14 @@ _client: AWClient | None = None
 
 
 def get_client() -> AWClient:
-    """Lazy singleton configured from the environment (AW_CACHE_PATH, AW_RATE_LIMIT)."""
+    """Lazy singleton configured from the environment (AW_CACHE_PATH, AW_RATE_LIMIT, AW_RATE_BURST)."""
     global _client
     if _client is None:
         disk_path = os.environ.get("AW_CACHE_PATH")
-        rate = int(os.environ.get("AW_RATE_LIMIT", "24"))
+        rate = float(os.environ.get("AW_RATE_LIMIT", "12"))
+        burst = int(os.environ.get("AW_RATE_BURST", "4"))
         cache = LayeredCache(TTLCache(), DiskCache(disk_path) if disk_path else None)
-        _client = AWClient(cache=cache, limiter=RateLimiter(max_calls=rate))
+        _client = AWClient(cache=cache, limiter=RateLimiter(rate_per_minute=rate, burst=burst))
     return _client
 
 

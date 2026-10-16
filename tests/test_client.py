@@ -8,34 +8,7 @@ import pytest
 
 from aw.client import AWClient, RateLimiter, normalize_params
 from aw.errors import AWApiError, AWBudgetExceeded, AWNotFound, AWRateLimited
-
-
-class TestRateLimiter:
-    async def test_blocks_after_max_calls_until_window_passes(self):
-        now = [0.0]
-        slept: list[float] = []
-
-        async def fake_sleep(seconds: float) -> None:
-            slept.append(seconds)
-            now[0] += seconds
-
-        limiter = RateLimiter(max_calls=3, period=60.0, clock=lambda: now[0], sleep=fake_sleep)
-        for _ in range(3):
-            await limiter.acquire()
-        assert slept == []
-        await limiter.acquire()  # 4th call inside the window must wait for the first to expire
-        assert len(slept) == 1 and 59.9 < slept[0] < 60.1
-
-    async def test_block_for_delays_everything(self):
-        now = [0.0]
-
-        async def fake_sleep(seconds: float) -> None:
-            now[0] += seconds
-
-        limiter = RateLimiter(max_calls=10, clock=lambda: now[0], sleep=fake_sleep)
-        limiter.block_for(20)
-        await limiter.acquire()
-        assert now[0] >= 20
+from aw.ratelimit import BACKOFF_SCHEDULE
 
 
 class TestNormalizeParams:
@@ -90,23 +63,84 @@ class TestErrors:
         with pytest.raises(AWApiError, match="Non-JSON"):
             await client.session().list("poll", {})
 
-    async def test_429_then_success(self, api, client):
+    async def test_429_then_success_honours_retry_after_and_slows_down(self, api, client, clock):
         calls = {"n": 0}
 
         def handler(request):
             calls["n"] += 1
             if calls["n"] == 1:
-                return httpx.Response(429, headers={"Retry-After": "1"})
+                return httpx.Response(429, headers={"Retry-After": "7"})
             return httpx.Response(200, json={"meta": {"status": "ok", "result": {"total": 1}}, "data": [{"id": 1}]})
 
         api.add_response("polls", handler)
-        res = await client.session().list("poll", {})
+        s = client.session()
+        res = await s.list("poll", {})
         assert res.items == [{"id": 1}] and calls["n"] == 2
+        assert clock.now >= 7  # paused for the Retry-After the API sent
+        assert client.limiter.slowdown == 2.0  # and halved its pace
+        assert s.usage()["throttled_s"] >= 7
 
-    async def test_repeated_429_raises_rate_limited(self, api, client):
+    async def test_429_without_retry_after_uses_the_backoff_schedule(self, api, client, clock):
+        calls = {"n": 0}
+
+        def handler(request):
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                return httpx.Response(429)
+            return httpx.Response(200, json={"meta": {"status": "ok", "result": {"total": 0}}, "data": []})
+
+        api.add_response("polls", handler)
+        await client.session().list("poll", {})
+        assert calls["n"] == 3 and clock.now >= BACKOFF_SCHEDULE[0] + BACKOFF_SCHEDULE[1]  # waits grow with each 429
+
+    async def test_repeated_429_gives_up_after_three_answers(self, api, client):
         api.add_response("polls", lambda r: httpx.Response(429))
-        with pytest.raises(AWRateLimited):
+        with pytest.raises(AWRateLimited, match="even after backing off"):
             await client.session().list("poll", {})
+        assert len(api.requests) == 3
+
+    async def test_a_429_pauses_later_requests_of_other_calls_too(self, api, client, clock):
+        state = {"n": 0}
+
+        def flaky(request):
+            state["n"] += 1
+            if state["n"] == 1:
+                return httpx.Response(429, headers={"Retry-After": "12"})
+            return httpx.Response(200, json={"meta": {"status": "ok", "result": {"total": 0}}, "data": []})
+
+        api.add_response("polls", flaky)
+        api.add("topics", [])
+        await client.session().list("poll", {})
+        assert clock.now >= 12
+        await client.session().list("topic", {})  # an unrelated call afterwards is not pushed past the pause again
+        assert len(api.requests) == 3 and clock.now < 30
+
+    async def test_throttle_wait_is_reported_in_usage(self, api, make_client, clock):
+        c = make_client(limiter=RateLimiter(rate_per_minute=24, burst=1, min_gap=0, clock=clock.monotonic, sleep=clock.sleep))
+        for path in ("polls", "topics", "parliaments"):
+            api.add(path, [])
+        s = c.session()
+        await s.list("poll", {})
+        await s.list("topic", {})
+        await s.list("parliament", {})
+        assert s.requests == 3 and s.usage()["throttled_s"] == pytest.approx(5.0)  # two waits of 2.5 s (24/min)
+
+    async def test_no_throttle_key_when_nothing_waited(self, api, client):
+        api.add("polls", [])
+        s = client.session()
+        await s.list("poll", {})
+        assert "throttled_s" not in s.usage()
+
+    async def test_envelope_tells_the_model_when_a_call_was_slowed_down(self, client):
+        from aw.envelope import envelope
+
+        s = client.session()
+        s.throttled = 7.4
+        out = envelope("x", {}, session=s)
+        assert out["meta"]["throttled_s"] == 7.4
+        assert any("Waited 7s" in n for n in out["notes"])
+        s.throttled = 0.4
+        assert not any("Waited" in n for n in envelope("x", {}, session=s)["notes"])
 
     async def test_gateway_error_is_retried(self, api, client):
         calls = {"n": 0}

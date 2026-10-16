@@ -6,24 +6,39 @@ and votes can change, so assertions stick to structure and long-settled history 
 """
 from __future__ import annotations
 
+import asyncio
+
 import pytest
+import pytest_asyncio
 from fastmcp import Client
 
-from aw.client import AWClient, RateLimiter, set_client
+from aw.client import AWClient, get_client, set_client
+from aw.ratelimit import RateLimiter
 from server import build_server
 
-pytestmark = pytest.mark.live
+# one event loop and ONE client/limiter for the whole module: that is how the real server process behaves,
+# and the API's rate limit is per IP, so separate limiters per test would only create artificial bursts
+pytestmark = [pytest.mark.live, pytest.mark.asyncio(loop_scope="module")]
 SCHOLZ = 66924
+RATE_LIMITED: list[float] = []  # one entry per HTTP 429 the API sent during this run
 
 
-@pytest.fixture
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
 async def live():
-    real = AWClient(limiter=RateLimiter(max_calls=24))
+    original = RateLimiter.on_rate_limited
+
+    def spy(self, retry_after=None):
+        RATE_LIMITED.append(retry_after or 0.0)
+        return original(self, retry_after)
+
+    RateLimiter.on_rate_limited = spy
+    real = AWClient()
     set_client(real)
     async with Client(build_server()) as c:
         yield c
     await real.aclose()
     set_client(None)
+    RateLimiter.on_rate_limited = original
 
 
 async def run(c: Client, tool: str, **args) -> dict:
@@ -81,3 +96,19 @@ async def test_reference_data(live):
     assert len(parliaments["data"]) == 18 and any(p["name"] == "EU-Parlament" for p in parliaments["data"])
     topics = await run(live, "aw_lookup", kind="topic", query="Energie")
     assert topics["data"][0]["id"] == 20
+
+
+async def test_concurrent_requests_are_paced(live):
+    """Sixteen distinct requests started at the same instant (like asyncio.gather inside a tool)."""
+    session = get_client().session(budget=100)
+    results = await asyncio.gather(*(session.list("politician", {"last_name[cn]": ch, "range_end": 1}) for ch in "abcdefghijklmnop"))
+    assert len(results) == 16 and session.usage()["requests"] == 16
+
+
+async def test_no_429_during_the_whole_live_run(live):
+    """The API rejects bursts (<1 s apart) and anything above ~15 requests/minute sustained.
+
+    Everything this module did - tool calls, a concurrent flood, several minutes of traffic - must have been
+    accepted without a single HTTP 429 (this test runs last).
+    """
+    assert RATE_LIMITED == [], f"API answered HTTP 429 {len(RATE_LIMITED)} time(s)"

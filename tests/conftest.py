@@ -92,7 +92,7 @@ def make_client(api: FakeAPI, clock: FakeClock):
         kwargs: dict[str, Any] = {
             "transport": httpx.MockTransport(api.handle),
             "cache": LayeredCache(TTLCache()),
-            "limiter": RateLimiter(max_calls=10_000, clock=clock.monotonic, sleep=clock.sleep),
+            "limiter": RateLimiter(rate_per_minute=1_000_000, burst=1_000_000, min_gap=0, clock=clock.monotonic, sleep=clock.sleep),
             "sleep": clock.sleep,
         }
         kwargs.update(overrides)
